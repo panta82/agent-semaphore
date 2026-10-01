@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+#
+# agent-semaphore: run a command while holding one of N machine-wide slots.
+#
+# Meant for coding agents that would otherwise start heavy jobs (test suites,
+# builds) all at once. Callers that don't get a slot wait in a queue.
+#
+# Queue + slot design borrowed from https://github.com/timbunce/semaphoric
+
+set -euo pipefail
+
+VERSION=0.1.0
+EXIT_TIMEOUT=75 # EX_TEMPFAIL
+
+# Fixed descriptors instead of {fd}> so this runs on bash 3.2 (macOS).
+QUEUE_FD=8
+SLOT_FD=9
+
+usage() {
+  cat <<EOF
+agent-semaphore $VERSION
+
+Usage:
+  agent-semaphore --name NAME --count N [options] [--] COMMAND [ARGS...]
+  agent-semaphore --status [--name NAME]
+
+Runs COMMAND once one of N slots of the semaphore NAME is free. A single
+COMMAND argument is run through 'bash -c', so quoted command lines work:
+  agent-semaphore -n tests -c 2 'cd backend && npm test'
+
+Options:
+  -n, --name NAME     semaphore name; each name is an independent set of slots
+  -c, --count N       number of slots, i.e. max concurrent commands
+  -t, --timeout SECS  give up after waiting this long, exit $EXIT_TIMEOUT (default: wait forever)
+  -p, --poll SECS     delay between slot checks while waiting (default: 2)
+  -r, --report SECS   delay between "still waiting" messages (default: 30)
+  -q, --quiet         don't print waiting messages
+  -d, --dir DIR       lock directory (default: \$AGENT_SEMAPHORE_DIR,
+                      else \$XDG_RUNTIME_DIR/agent-semaphore, else /tmp/agent-semaphore-UID)
+  -s, --status        show slots and who holds them
+  -h, --help          show this help
+  -V, --version       show version
+
+The slot is held until the command and every process it started have exited.
+The exit status is that of the command.
+EOF
+}
+
+die() {
+  echo "agent-semaphore: $*" >&2
+  exit 2
+}
+
+name=
+count=
+timeout=0
+poll=2
+report=30
+quiet=0
+dir=${AGENT_SEMAPHORE_DIR:-}
+mode=run
+
+need_value() {
+  [[ $# -ge 2 ]] || die "option $1 needs a value"
+}
+
+while (($#)); do
+  case $1 in
+    -n | --name) need_value "$@"; name=$2; shift 2 ;;
+    --name=*) name=${1#*=}; shift ;;
+    -c | --count) need_value "$@"; count=$2; shift 2 ;;
+    --count=*) count=${1#*=}; shift ;;
+    -t | --timeout) need_value "$@"; timeout=$2; shift 2 ;;
+    --timeout=*) timeout=${1#*=}; shift ;;
+    -p | --poll) need_value "$@"; poll=$2; shift 2 ;;
+    --poll=*) poll=${1#*=}; shift ;;
+    -r | --report) need_value "$@"; report=$2; shift 2 ;;
+    --report=*) report=${1#*=}; shift ;;
+    -d | --dir) need_value "$@"; dir=$2; shift 2 ;;
+    --dir=*) dir=${1#*=}; shift ;;
+    -q | --quiet) quiet=1; shift ;;
+    -s | --status) mode=status; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -V | --version) echo "$VERSION"; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) break ;;
+  esac
+done
+
+command -v flock >/dev/null || die "flock not found (macOS: brew install flock)"
+
+if [[ -z $dir ]]; then
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    dir=$XDG_RUNTIME_DIR/agent-semaphore
+  else
+    dir=${TMPDIR:-/tmp}/agent-semaphore-$(id -u)
+  fi
+fi
+
+[[ -z $name || $name =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid name '$name' (allowed: letters, digits, . _ -)"
+
+format_age() {
+  local s=$1
+  if ((s < 60)); then
+    echo "${s}s"
+  elif ((s < 3600)); then
+    echo "$((s / 60))m$((s % 60))s"
+  else
+    echo "$((s / 3600))h$((s % 3600 / 60))m"
+  fi
+}
+
+show_status() {
+  local sem_dir sem slot busy total lines now pid started cwd cmd
+  now=$(date +%s)
+  shopt -s nullglob
+  for sem_dir in "$dir"/*/; do
+    sem=$(basename "$sem_dir")
+    [[ -z $name || $name == "$sem" ]] || continue
+    busy=0
+    lines=
+    read -r total <"${sem_dir}count" 2>/dev/null || continue
+    for ((slot = 1; slot <= total; slot++)); do
+      # Probing takes the lock for an instant; a caller racing with us just polls again.
+      if flock -n "$sem_dir$slot.lock" true 2>/dev/null; then
+        lines+="  $slot  free"$'\n'
+      else
+        busy=$((busy + 1))
+        IFS=$'\t' read -r pid started cwd cmd <"$sem_dir$slot.info" || true
+        lines+="  $slot  busy  pid ${pid:-?}  $(format_age $((now - ${started:-now})))  ${cwd:-?}  ${cmd:-?}"$'\n'
+      fi
+    done
+    echo "$sem: $busy/$total busy"
+    printf '%s' "$lines"
+  done
+}
+
+if [[ $mode == status ]]; then
+  [[ -d $dir ]] || exit 0
+  show_status
+  exit 0
+fi
+
+[[ -n $name ]] || die "--name is required (see --help)"
+[[ $count =~ ^[1-9][0-9]*$ ]] || die "--count must be a positive integer (see --help)"
+[[ $timeout =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
+[[ $report =~ ^[1-9][0-9]*$ ]] || die "--report must be a positive number of seconds"
+(($#)) || die "no command given (see --help)"
+
+run_command() {
+  if (($# == 1)); then
+    exec bash -c "$1"
+  fi
+  exec "$@"
+}
+
+# A command that already holds this semaphore must not queue for it again.
+if [[ ":${AGENT_SEMAPHORE_HELD:-}:" == *":$name:"* ]]; then
+  run_command "$@"
+fi
+
+sem_dir=$dir/$name
+mkdir -p "$sem_dir"
+
+started_waiting=$SECONDS
+last_report=-$report
+reported=0
+
+note() {
+  ((quiet)) || echo "agent-semaphore[$name]: $*" >&2
+}
+
+# Called each time we fail to get in: enforces --timeout and reports progress.
+still_waiting() {
+  local waited=$((SECONDS - started_waiting))
+  if ((timeout > 0 && waited >= timeout)); then
+    echo "agent-semaphore[$name]: gave up after ${waited}s, command was not run" >&2
+    exit $EXIT_TIMEOUT
+  fi
+  if ((SECONDS - last_report >= report)); then
+    note "$1, waited $(format_age "$waited")"
+    last_report=$SECONDS
+    reported=1
+  fi
+}
+
+# Waiters line up on the queue lock, so only the one at the front polls the slots.
+eval "exec $QUEUE_FD>>\"\$sem_dir/queue.lock\""
+until flock -w "$poll" "$QUEUE_FD"; do
+  still_waiting "queued behind other waiters"
+done
+
+while :; do
+  for ((slot = 1; slot <= count; slot++)); do
+    eval "exec $SLOT_FD>>\"\$sem_dir/\$slot.lock\""
+    if flock -n "$SLOT_FD"; then
+      printf '%s\t%s\t%s\t%s\n' "$$" "$(date +%s)" "$PWD" "$*" >"$sem_dir/$slot.info"
+      echo "$count" >"$sem_dir/count"
+      eval "exec $QUEUE_FD>&-"
+      ((reported)) && note "got slot $slot/$count, running"
+      export AGENT_SEMAPHORE_HELD="${AGENT_SEMAPHORE_HELD:+$AGENT_SEMAPHORE_HELD:}$name"
+      # The slot descriptor stays open across exec; that is what holds the slot.
+      run_command "$@"
+    fi
+    eval "exec $SLOT_FD>&-"
+  done
+  still_waiting "all $count slots busy"
+  sleep "$poll"
+done
