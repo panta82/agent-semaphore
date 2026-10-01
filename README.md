@@ -86,3 +86,7 @@ tests: 1/2 busy
 ## Credits
 
 Queue and slot design borrowed from [timbunce/semaphoric](https://github.com/timbunce/semaphoric).
+
+## License
+
+MIT
