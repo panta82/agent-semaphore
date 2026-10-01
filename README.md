@@ -57,20 +57,79 @@ agent-semaphore -n tests -c 6 npx jest src/foo.spec.ts    # one spec, weight 1
 
 With 6 slots that allows one full run plus two single specs, or six single specs, but never two full runs.
 
-## Named wrappers
+## Recommended setup
 
-Give agents one short command per semaphore. Use a wrapper script, not a shell alias: agents run commands in non-interactive shells, which don't expand aliases.
+The semaphore limits how many heavy commands run. On Linux with systemd, three more pieces decide who suffers when memory runs short anyway. The files are in [examples/](examples).
+
+### 1. One wrapper command for agents
+
+Agents should not type the name and count themselves: one that passes a different count sees a different set of slots. Put them in a wrapper script. Use a script, not a shell alias, because agents run commands in non-interactive shells, which don't expand aliases.
+
+[examples/run-tests](examples/run-tests) queues on the `tests` semaphore with 6 slots and then runs the command inside `tests.slice`:
 
 ```bash
-#!/bin/sh
-# ~/.local/bin/test-semaphore
-exec agent-semaphore --name tests --count 2 "$@"
+install -m 755 examples/run-tests ~/.local/bin/run-tests
+
+run-tests 'npx jest src/foo.spec.ts'
+run-tests --weight 4 'npm test'
 ```
 
+Without a systemd user session it prints a warning and runs under the semaphore only.
+
+### 2. A memory ceiling for tests
+
+Commands started by an agent live in the agent's cgroup, so their memory is billed to the agent host. Under memory pressure `systemd-oomd` kills whole cgroups, and the agent host is then the biggest candidate.
+
+[examples/tests.slice](examples/tests.slice) gives tests their own cgroup with a ceiling for all runs together:
+
 ```bash
-test-semaphore 'npm test'
-test-semaphore npx jest src/foo.spec.ts
+cp examples/tests.slice ~/.config/systemd/user/
+systemctl --user daemon-reload
 ```
+
+Tests are throttled above `MemoryHigh`. Past `MemoryMax` the kernel kills a process inside the slice, typically a test worker, and nothing outside it. Size the limits to roughly `count x memory per slot`.
+
+### 3. Protect the apps that must survive
+
+[examples/oom-protect.conf](examples/oom-protect.conf) marks a service as one `systemd-oomd` should avoid and keeps part of its memory out of swap. Install it as a drop-in for the agent host and the IDE:
+
+```bash
+mkdir -p ~/.config/systemd/user/my-agent-host.service.d
+cp examples/oom-protect.conf ~/.config/systemd/user/my-agent-host.service.d/
+systemctl --user daemon-reload
+```
+
+The drop-in applies on the next start of the service. To apply it to a running one without a restart:
+
+```bash
+systemctl --user set-property --runtime my-agent-host.service MemoryLow=2G ManagedOOMPreference=avoid
+```
+
+Apps started from a desktop launcher run as `app-<name>@<id>.service`. For those, put the drop-in in `app-<name>@.service.d/`; `systemctl --user list-units 'app-*'` shows the names.
+
+### 4. Tell the agents
+
+In the instructions file your agents read on this machine (`AGENTS.md`, `CLAUDE.md`):
+
+````markdown
+There's only so many tests this computer can run. When running tests, always do it like this:
+
+```bash
+run-tests '<your tests command>'
+```
+
+This applies to every test command, including a single test file.
+
+If the test suite you're running spawns multiple workers, add the `--weight <N>` argument, where N is the number of workers it will spawn. Eg.
+
+```bash
+run-tests --weight 4 'npm run test'
+```
+
+If the slots are busy, the command waits and prints "need N of 6 slots". This is normal: don't cancel or retry. The wait can be long, so run it in the background or with a long timeout.
+
+A test worker killed with SIGKILL means the memory limit was hit, not that the test is broken. Run it again once before debugging.
+````
 
 ## Status
 

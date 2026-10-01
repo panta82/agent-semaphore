@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# The one command agents use to run tests on this machine.
+# Queues the command on the machine-wide "tests" semaphore, then runs it inside
+# tests.slice, which caps the memory of all tests together.
+#
+# usage: run-tests [--weight N] '<command>'
+#        run-tests [--weight N] <command> [args...]
+
+set -euo pipefail
+
+COUNT=6
+SLICE=tests.slice
+
+weight=1
+case ${1:-} in
+  -w | --weight) weight=${2:?--weight needs a value}; shift 2 ;;
+  --weight=*) weight=${1#*=}; shift ;;
+esac
+[[ ${1:-} == -- ]] && shift
+
+if (($# == 0)); then
+  echo "usage: run-tests [--weight N] '<command>'" >&2
+  exit 2
+fi
+
+if (($# == 1)); then
+  set -- bash -c "$1"
+fi
+
+scope=(systemd-run --user --scope --quiet --slice="$SLICE" --)
+if ! "${scope[@]}" true 2>/dev/null; then
+  echo "run-tests: can't start a systemd scope here, running without the memory cap" >&2
+  scope=()
+fi
+
+exec agent-semaphore --name tests --count "$COUNT" --weight "$weight" -- "${scope[@]}" "$@"

@@ -1,0 +1,11 @@
+# Memory ceiling for everything started through run-tests, all runs together.
+# Install as ~/.config/systemd/user/tests.slice
+[Unit]
+Description=Agent-run tests
+
+[Slice]
+# Above this, tests are throttled and their memory is reclaimed first.
+MemoryHigh=8G
+# Hard limit. Past it the kernel kills a process inside the slice.
+MemoryMax=10G
+MemorySwapMax=2G
