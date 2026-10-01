@@ -50,6 +50,16 @@ check "status shows the holder" "$("$sem" --status -n busy | sed -n 1p)" "busy: 
 wait
 check "status shows the slot free again" "$("$sem" --status -n busy | sed -n 1p)" "busy: 0/1 busy"
 
+"$sem" -n weight -c 3 -w 2 sleep 2 &
+sleep 0.5
+check "weight takes that many slots" "$("$sem" --status -n weight | sed -n 1p)" "weight: 2/3 busy"
+check "a light command fits beside it" "$("$sem" -n weight -c 3 -t 1 echo fits)" fits
+"$sem" -n weight -c 3 -w 2 -t 1 -p 1 -q true 2>/dev/null
+check "a second heavy command waits" $? 75
+wait
+
+check "weight above count runs alone" "$("$sem" -n clamp -c 2 -w 5 -q echo alone)" alone
+
 "$sem" -n held -c 1 'sleep 2 & disown'
 "$sem" -n held -c 1 -t 1 -p 1 -q true 2>/dev/null
 check "slot stays held while children live" $? 75

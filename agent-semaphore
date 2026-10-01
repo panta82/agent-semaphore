@@ -9,12 +9,13 @@
 
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 EXIT_TIMEOUT=75 # EX_TEMPFAIL
 
 # Fixed descriptors instead of {fd}> so this runs on bash 3.2 (macOS).
 QUEUE_FD=8
-SLOT_FD=9
+# Slot K is held on descriptor SLOT_FD_BASE + K.
+SLOT_FD_BASE=9
 
 usage() {
   cat <<EOF
@@ -24,13 +25,15 @@ Usage:
   agent-semaphore --name NAME --count N [options] [--] COMMAND [ARGS...]
   agent-semaphore --status [--name NAME]
 
-Runs COMMAND once one of N slots of the semaphore NAME is free. A single
+Runs COMMAND once enough of the N slots of the semaphore NAME are free. A single
 COMMAND argument is run through 'bash -c', so quoted command lines work:
   agent-semaphore -n tests -c 2 'cd backend && npm test'
 
 Options:
   -n, --name NAME     semaphore name; each name is an independent set of slots
-  -c, --count N       number of slots, i.e. max concurrent commands
+  -c, --count N       number of slots
+  -w, --weight N      slots this command takes (default: 1); a weight above
+                      the count is lowered to the count, so the command runs alone
   -t, --timeout SECS  give up after waiting this long, exit $EXIT_TIMEOUT (default: wait forever)
   -p, --poll SECS     delay between slot checks while waiting (default: 2)
   -r, --report SECS   delay between "still waiting" messages (default: 30)
@@ -41,7 +44,7 @@ Options:
   -h, --help          show this help
   -V, --version       show version
 
-The slot is held until the command and every process it started have exited.
+The slots are held until the command and every process it started have exited.
 The exit status is that of the command.
 EOF
 }
@@ -53,6 +56,7 @@ die() {
 
 name=
 count=
+weight=1
 timeout=0
 poll=2
 report=30
@@ -70,6 +74,8 @@ while (($#)); do
     --name=*) name=${1#*=}; shift ;;
     -c | --count) need_value "$@"; count=$2; shift 2 ;;
     --count=*) count=${1#*=}; shift ;;
+    -w | --weight) need_value "$@"; weight=$2; shift 2 ;;
+    --weight=*) weight=${1#*=}; shift ;;
     -t | --timeout) need_value "$@"; timeout=$2; shift 2 ;;
     --timeout=*) timeout=${1#*=}; shift ;;
     -p | --poll) need_value "$@"; poll=$2; shift 2 ;;
@@ -144,6 +150,7 @@ fi
 
 [[ -n $name ]] || die "--name is required (see --help)"
 [[ $count =~ ^[1-9][0-9]*$ ]] || die "--count must be a positive integer (see --help)"
+[[ $weight =~ ^[1-9][0-9]*$ ]] || die "--weight must be a positive integer"
 [[ $timeout =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 [[ $report =~ ^[1-9][0-9]*$ ]] || die "--report must be a positive number of seconds"
 (($#)) || die "no command given (see --help)"
@@ -185,26 +192,48 @@ still_waiting() {
   fi
 }
 
+if ((weight > count)); then
+  note "weight $weight is above the count, using $count"
+  weight=$count
+fi
+
 # Waiters line up on the queue lock, so only the one at the front polls the slots.
+# That also makes taking several slots safe: nobody else can grab some in between.
 eval "exec $QUEUE_FD>>\"\$sem_dir/queue.lock\""
 until flock -w "$poll" "$QUEUE_FD"; do
   still_waiting "queued behind other waiters"
 done
 
 while :; do
-  for ((slot = 1; slot <= count; slot++)); do
-    eval "exec $SLOT_FD>>\"\$sem_dir/\$slot.lock\""
-    if flock -n "$SLOT_FD"; then
-      printf '%s\t%s\t%s\t%s\n' "$$" "$(date +%s)" "$PWD" "$*" >"$sem_dir/$slot.info"
-      echo "$count" >"$sem_dir/count"
-      eval "exec $QUEUE_FD>&-"
-      ((reported)) && note "got slot $slot/$count, running"
-      export AGENT_SEMAPHORE_HELD="${AGENT_SEMAPHORE_HELD:+$AGENT_SEMAPHORE_HELD:}$name"
-      # The slot descriptor stays open across exec; that is what holds the slot.
-      run_command "$@"
+  held=()
+  for ((slot = 1; slot <= count && ${#held[@]} < weight; slot++)); do
+    fd=$((SLOT_FD_BASE + slot))
+    eval "exec $fd>>\"\$sem_dir/\$slot.lock\""
+    if flock -n "$fd"; then
+      held+=("$slot")
+    else
+      eval "exec $fd>&-"
     fi
-    eval "exec $SLOT_FD>&-"
   done
-  still_waiting "all $count slots busy"
+
+  if ((${#held[@]} == weight)); then
+    started=$(date +%s)
+    for slot in "${held[@]}"; do
+      printf '%s\t%s\t%s\t%s\n' "$$" "$started" "$PWD" "$*" >"$sem_dir/$slot.info"
+    done
+    echo "$count" >"$sem_dir/count"
+    eval "exec $QUEUE_FD>&-"
+    ((reported)) && note "got $weight of $count slots, running"
+    export AGENT_SEMAPHORE_HELD="${AGENT_SEMAPHORE_HELD:+$AGENT_SEMAPHORE_HELD:}$name"
+    # The slot descriptors stay open across exec; that is what holds the slots.
+    run_command "$@"
+  fi
+
+  free=${#held[@]}
+  # All or nothing: a partial hold would show as busy without running anything.
+  for slot in ${held[@]+"${held[@]}"}; do
+    eval "exec $((SLOT_FD_BASE + slot))>&-"
+  done
+  still_waiting "need $weight of $count slots, $free free"
   sleep "$poll"
 done
